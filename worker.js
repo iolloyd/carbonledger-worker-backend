@@ -1,5 +1,14 @@
 // Helper function to format the response with CORS headers
-function jsonResponse(data, status = 200) {
+function jsonResponse(data, request, status = 200) {
+  const origin = request.headers.get('Origin') || '';
+  const isAllowedOrigin = ALLOWED_ORIGINS.includes(origin);
+  const corsHeaders = {
+    "Access-Control-Allow-Origin": isAllowedOrigin ? origin : ALLOWED_ORIGINS[0],
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Credentials": "true",
+  };
+  
   return new Response(JSON.stringify(data), {
     status,
     headers: {
@@ -129,7 +138,7 @@ export default {
           const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
           
           if (latestTimestamp > thirtyMinutesAgo) {
-            return jsonResponse(dbResults);
+            return jsonResponse(dbResults, request);
           }
         }
 
@@ -147,10 +156,10 @@ export default {
             .reduce((sum, mix) => sum + mix.perc, 0)
         }));
 
-        return jsonResponse(results);
+        return jsonResponse(results, request);
       } catch (error) {
         console.error('Error fetching energy data:', error);
-        return jsonResponse({ error: "Failed to fetch energy data: " + error.message }, 500);
+        return jsonResponse({ error: "Failed to fetch energy data: " + error.message }, request, 500);
       }
     }
 
@@ -161,7 +170,7 @@ export default {
         const hours = parseInt(params.hours) || 24;
         
         if (!region) {
-          return jsonResponse({ error: "Region parameter is required" }, 400);
+          return jsonResponse({ error: "Region parameter is required" }, request, 400);
         }
 
         const { results } = await env.DB.prepare(`
@@ -183,13 +192,13 @@ export default {
         ).all();
         
         if (!results || results.length === 0) {
-          return jsonResponse({ error: "No data found for the specified region and time range" }, 404);
+          return jsonResponse({ error: "No data found for the specified region and time range" }, request, 404);
         }
         
-        return jsonResponse(results);
+        return jsonResponse(results, request);
       } catch (error) {
         console.error('Error fetching energy history:', error);
-        return jsonResponse({ error: "Failed to fetch energy history" }, 500);
+        return jsonResponse({ error: "Failed to fetch energy history" }, request, 500);
       }
     }
 
@@ -199,11 +208,11 @@ export default {
         const { name, email } = await request.json();
 
         if (!name || !email) {
-          return jsonResponse({ error: "Name and email are required" }, 400);
+          return jsonResponse({ error: "Name and email are required" }, request, 400);
         }
 
         if (!email.includes("@")) {
-          return jsonResponse({ error: "Invalid email format" }, 400);
+          return jsonResponse({ error: "Invalid email format" }, request, 400);
         }
 
         try {
@@ -211,16 +220,16 @@ export default {
             "INSERT INTO waitlist (name, email) VALUES (?, ?)"
           ).bind(name, email).run();
 
-          return jsonResponse({ message: "Successfully joined waitlist" }, 201);
+          return jsonResponse({ message: "Successfully joined waitlist" }, request, 201);
         } catch (error) {
           if (error.message.includes("UNIQUE constraint failed")) {
-            return jsonResponse({ error: "Email already registered" }, 400);
+            return jsonResponse({ error: "Email already registered" }, request, 400);
           }
           throw error;
         }
       } catch (error) {
         console.error('Error processing request:', error);
-        return jsonResponse({ error: "Internal server error" }, 500);
+        return jsonResponse({ error: "Internal server error" }, request, 500);
       }
     }
 
@@ -316,14 +325,14 @@ export default {
           
           console.log('Successfully created session')
 
-          return jsonResponse({ token: sessionToken, user })
+          return jsonResponse({ token: sessionToken, user }, request)
         } catch (dbError) {
           console.error('Database operation failed:', dbError)
           throw new Error('Failed to store user data')
         }
       } catch (error) {
         console.error('OAuth callback error:', error)
-        return jsonResponse({ error: error.message || 'Authentication failed' }, 500)
+        return jsonResponse({ error: error.message || 'Authentication failed' }, request, 500)
       }
     }
 
@@ -332,7 +341,7 @@ export default {
         const token = request.headers.get('Authorization')?.replace('Bearer ', '')
         
         if (!token) {
-          return jsonResponse({ error: 'No token provided' }, 401)
+          return jsonResponse({ error: 'No token provided' }, request, 401)
         }
 
         const session = await env.DB.prepare(
@@ -343,13 +352,13 @@ export default {
         ).bind(token).first()
 
         if (!session) {
-          return jsonResponse({ error: 'Invalid or expired token' }, 401)
+          return jsonResponse({ error: 'Invalid or expired token' }, request, 401)
         }
 
-        return jsonResponse({ user: session })
+        return jsonResponse({ user: session }, request)
       } catch (error) {
         console.error('Token validation error:', error)
-        return jsonResponse({ error: 'Validation failed' }, 500)
+        return jsonResponse({ error: 'Validation failed' }, request, 500)
       }
     }
 
@@ -365,10 +374,10 @@ export default {
           }
         }
 
-        return jsonResponse({ success: true })
+        return jsonResponse({ success: true }, request)
       } catch (error) {
         console.error('Logout error:', error)
-        return jsonResponse({ error: 'Logout failed' }, 500)
+        return jsonResponse({ error: 'Logout failed' }, request, 500)
       }
     }
 
