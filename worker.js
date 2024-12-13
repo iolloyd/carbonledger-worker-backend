@@ -1,3 +1,10 @@
+const ALLOWED_ORIGINS = [
+  'https://carbonledger.tech',
+  'https://www.carbonledger.tech',
+  'http://127.0.0.1:8787',
+  'http://localhost:5173'
+];
+
 // Helper function to format the response with CORS headers
 function jsonResponse(data, request, status = 200) {
   const origin = request.headers.get('Origin') || '';
@@ -81,12 +88,6 @@ export default {
   // Handle HTTP requests
   async fetch(request, env) {
     const url = new URL(request.url);
-    const ALLOWED_ORIGINS = [
-      'https://carbonledger.tech',
-      'https://www.carbonledger.tech',
-      'http://127.0.0.1:8787',
-      'http://localhost:5173'
-    ];
     const origin = request.headers.get('Origin') || '';
     const isAllowedOrigin = ALLOWED_ORIGINS.includes(origin);
     const corsHeaders = {
