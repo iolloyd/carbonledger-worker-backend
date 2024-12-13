@@ -1,0 +1,32 @@
+name = "carbonledger-api"
+main = "worker.js"
+compatibility_date = "2023-12-12"
+
+# Production database
+[[d1_databases]]
+binding = "DB"
+database_name = "carbonledger"
+database_id = "fadbb0b5-6f38-4c16-b569-ef0ed36c4f46"
+
+# Development database
+[env.dev]
+[[env.dev.d1_databases]]
+binding = "DB"
+database_name = "carbonledger-dev"
+database_id = "ddf52fd3-8365-465d-a699-a97ad6b245c1"
+
+# Scheduled task to fetch energy data every 30 minutes
+[triggers]
+crons = ["*/30 * * * *"] 
+
+[vars]
+GOOGLE_CLIENT_ID = "779788637403-k1mdmttec0d3jtaujdh670g50lohc6qp.apps.googleusercontent.com"
+APP_URL = "https://app.carbonledger.tech"
+
+[observability.logs]
+enabled = true
+
+
+
+# Add your Google client secret using wrangler secret:
+# wrangler secret put GOOGLE_CLIENT_SECRET 
