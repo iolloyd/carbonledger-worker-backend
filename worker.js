@@ -1,6 +1,7 @@
 const ALLOWED_ORIGINS = [
   'https://carbonledger.tech',
   'https://www.carbonledger.tech',
+  'https://app.carbonledger.tech',
   'http://127.0.0.1:8787',
   'http://localhost:5173'
 ];
