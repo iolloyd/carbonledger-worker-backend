@@ -12,7 +12,10 @@ CREATE TABLE users (
   id TEXT PRIMARY KEY,
   email TEXT UNIQUE NOT NULL,
   name TEXT NOT NULL,
-  picture TEXT
+  picture TEXT,
+  region_id INTEGER,
+  address TEXT,
+  FOREIGN KEY (region_id) REFERENCES uk_regions(id)
 );
 
 CREATE TABLE sessions (

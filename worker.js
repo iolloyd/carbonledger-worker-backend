@@ -3,6 +3,7 @@ const ALLOWED_ORIGINS = [
   'https://www.carbonledger.tech',
   'https://app.carbonledger.tech',
   'http://127.0.0.1:8787',
+  'http://localhost:8787',
   'http://localhost:5173'
 ];
 
@@ -15,30 +16,35 @@ function jsonResponse(data, request, status = 200) {
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Allow-Credentials": "true",
+    "Content-Type": "application/json",
   };
   
   return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      "Content-Type": "application/json",
-      ...corsHeaders
-    },
+    headers: corsHeaders
   });
 }
 
 // Helper function to fetch data from Carbon Intensity API
 async function fetchCarbonIntensityData() {
-  const response = await fetch('https://api.carbonintensity.org.uk/regional', {
-    headers: {
-      'Accept': 'application/json'
+  try {
+    const response = await fetch('https://api.carbonintensity.org.uk/regional', {
+      headers: { 'Accept': 'application/json' }
+    });
+
+    if (!response.ok) {
+      console.error('API error:', await response.text());
+      throw new Error('Failed to fetch data');
     }
-  });
-  
-  if (!response.ok) {
-    throw new Error('Failed to fetch from Carbon Intensity API');
+
+    const data = await response.json();
+    console.log('Raw API Response:', JSON.stringify(data.data[0].regions[0], null, 2));
+
+    return data;
+  } catch (error) {
+    console.error('Error fetching data:', error);
+    throw error;
   }
-  
-  return response.json();
 }
 
 export default {
@@ -67,14 +73,11 @@ export default {
 
           await env.DB.prepare(`
             INSERT INTO energy_usage (
-              region_id, timestamp, demand_actual, 
-              generation_mw, carbon_intensity, renewable_percentage
-            ) VALUES (?, ?, ?, ?, ?, ?)
+              region_id, timestamp, carbon_intensity, renewable_percentage
+            ) VALUES (?, ?, ?, ?)
           `).bind(
             regionResult.id,
             timestamp,
-            region.demand,
-            region.generationmix.reduce((sum, mix) => sum + mix.perc * region.demand / 100, 0),
             region.intensity.forecast,
             renewablePercentage
           ).run();
@@ -89,6 +92,12 @@ export default {
   // Handle HTTP requests
   async fetch(request, env) {
     const url = new URL(request.url);
+    console.log('Environment variables:', {
+      APP_URL: env.APP_URL,
+      request_url: request.url,
+      pathname: url.pathname
+    });
+
     const origin = request.headers.get('Origin') || '';
     const isAllowedOrigin = ALLOWED_ORIGINS.includes(origin);
     const corsHeaders = {
@@ -105,7 +114,123 @@ export default {
       });
     }
 
-    // For 404 responses
+    // Handle auth routes
+    if (url.pathname.startsWith('/auth/')) {
+      if (request.method === "GET" && url.pathname === "/auth/validate") {
+        try {
+          const token = request.headers.get('Authorization')?.replace('Bearer ', '')
+          
+          if (!token) {
+            return jsonResponse({ error: 'No token provided' }, request, 401)
+          }
+
+          const session = await env.DB.prepare(
+            `SELECT users.* FROM sessions 
+             JOIN users ON users.id = sessions.user_id
+             WHERE sessions.token = ? 
+             AND sessions.expires_at > datetime('now')`
+          ).bind(token).first()
+
+          if (!session) {
+            return jsonResponse({ error: 'Invalid or expired token' }, request, 401)
+          }
+
+          return jsonResponse({ user: session }, request)
+        } catch (error) {
+          console.error('Token validation error:', error)
+          return jsonResponse({ error: 'Validation failed' }, request, 500)
+        }
+      }
+    }
+
+    // Handle email authentication
+    if (url.pathname === '/api/auth/email/request') {
+      if (request.method === 'POST') {
+        try {
+          const { email } = await request.json()
+          
+          if (!email) {
+            return jsonResponse({ error: 'Email is required' }, request, 400)
+          }
+
+          // Generate a 6-digit code
+          const code = Math.floor(100000 + Math.random() * 900000).toString()
+          const expiresAt = new Date(Date.now() + 15 * 60 * 1000) // 15 minutes
+
+          // Store the code
+          await env.DB.prepare(`
+            INSERT INTO verification_codes (email, code, expires_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT (email) DO UPDATE SET
+            code = excluded.code,
+            expires_at = excluded.expires_at
+          `).bind(email, code, expiresAt.toISOString()).run()
+
+          // TODO: Send email with code
+          // For development, log the code
+          console.log('Verification code for', email, ':', code)
+
+          return jsonResponse({ message: 'Verification code sent' }, request)
+        } catch (error) {
+          console.error('Error sending verification code:', error)
+          return jsonResponse({ error: 'Failed to send verification code' }, request, 500)
+        }
+      }
+    }
+
+    if (url.pathname === '/api/auth/email/verify') {
+      if (request.method === 'POST') {
+        try {
+          const { email, code } = await request.json()
+          
+          if (!email || !code) {
+            return jsonResponse({ error: 'Email and code are required' }, request, 400)
+          }
+
+          // Verify the code
+          const verificationResult = await env.DB.prepare(`
+            SELECT * FROM verification_codes
+            WHERE email = ?
+            AND code = ?
+            AND expires_at > datetime('now')
+          `).bind(email, code).first()
+
+          if (!verificationResult) {
+            return jsonResponse({ error: 'Invalid or expired code' }, request, 400)
+          }
+
+          // Create or update user
+          const user = await upsertUser(env.DB, {
+            email,
+            name: email.split('@')[0], // Use part before @ as name
+            picture: null
+          })
+
+          // Generate session token
+          const token = await createSessionToken(user)
+
+          // Store session
+          const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000) // 24 hours
+          await env.DB.prepare(`
+            INSERT INTO sessions (user_id, token, expires_at)
+            VALUES (?, ?, ?)
+          `).bind(user.id, token, expiresAt.toISOString()).run()
+
+          // Delete used verification code
+          await env.DB.prepare(`
+            DELETE FROM verification_codes
+            WHERE email = ?
+          `).bind(email).run()
+
+          return jsonResponse({ token, user }, request)
+        } catch (error) {
+          console.error('Error verifying code:', error)
+          return jsonResponse({ error: 'Failed to verify code' }, request, 500)
+        }
+      }
+    }
+
+    // For non-auth routes, check API prefix
     if (!url.pathname.startsWith('/api/')) {
       return new Response("Not found", { 
         status: 404,
@@ -113,7 +238,74 @@ export default {
       });
     }
 
+    // API endpoints
     // Energy data endpoints
+    if (request.method === "GET" && url.pathname.startsWith('/api/energy/usage/')) {
+      console.log('Energy usage request received');
+      try {
+        const timeframe = url.pathname.split('/').pop(); // Get 'day', 'week', or 'month'
+        let hoursToFetch;
+        
+        switch (timeframe) {
+          case 'day':
+            hoursToFetch = 24;
+            break;
+          case 'week':
+            hoursToFetch = 24 * 7;
+            break;
+          case 'month':
+            hoursToFetch = 24 * 30;
+            break;
+          default:
+            return jsonResponse({ error: "Invalid timeframe. Use 'day', 'week', or 'month'" }, request, 400);
+        }
+
+        const { results } = await env.DB.prepare(`
+          WITH latest_data AS (
+            SELECT 
+              r.name as region,
+              e.timestamp,
+              e.carbon_intensity,
+              e.renewable_percentage,
+              ROW_NUMBER() OVER (PARTITION BY r.name ORDER BY e.timestamp DESC) as rn
+            FROM energy_usage e
+            JOIN uk_regions r ON e.region_id = r.id
+            WHERE e.timestamp >= datetime('now', ?)
+          )
+          SELECT 
+            region,
+            timestamp,
+            carbon_intensity,
+            renewable_percentage
+          FROM latest_data
+          WHERE rn = 1
+          ORDER BY timestamp DESC;
+        `).bind(`-${hoursToFetch} hours`).all();
+
+        if (!results || results.length === 0) {
+          // If no data in DB, fetch from external API
+          const data = await fetchCarbonIntensityData();
+          const timestamp = new Date().toISOString();
+          
+          const transformedData = data.data[0].regions.map(region => ({
+            timestamp,
+            region: region.shortname,
+            carbon_intensity: region.intensity.forecast,
+            renewable_percentage: region.generationmix
+              .filter(mix => ['wind', 'solar', 'hydro', 'biomass'].includes(mix.fuel))
+              .reduce((sum, mix) => sum + mix.perc, 0)
+          }));
+
+          return jsonResponse(transformedData, request);
+        }
+
+        return jsonResponse(results, request);
+      } catch (error) {
+        console.error('Error fetching energy usage data:', error);
+        return jsonResponse({ error: "Failed to fetch energy usage data" }, request, 500);
+      }
+    }
+
     if (request.method === "GET" && url.pathname === "/api/energy/latest") {
       try {
         // First try to get latest data from our database
@@ -124,8 +316,6 @@ export default {
           SELECT 
             r.name as region,
             e.timestamp,
-            e.demand_actual,
-            e.generation_mw,
             e.carbon_intensity,
             e.renewable_percentage
           FROM energy_usage e
@@ -147,18 +337,40 @@ export default {
         // If we don't have recent data, fetch it from the API
         console.log('Fetching fresh data from Carbon Intensity API');
         const data = await fetchCarbonIntensityData();
-        const results = data.data[0].regions.map(region => ({
-          region: region.shortname,
-          timestamp: data.data[0].from,
-          demand_actual: region.demand,
-          generation_mw: region.generationmix.reduce((sum, mix) => sum + mix.perc * region.demand / 100, 0),
-          carbon_intensity: region.intensity.forecast,
-          renewable_percentage: region.generationmix
-            .filter(mix => ['wind', 'solar', 'hydro', 'biomass'].includes(mix.fuel))
-            .reduce((sum, mix) => sum + mix.perc, 0)
+        const results = await Promise.all(data.data[0].regions.map(async region => {
+          // Get or create region
+          const regionResult = await env.DB.prepare(
+            'SELECT id FROM uk_regions WHERE name = ?'
+          ).bind(region.shortname).first();
+
+          if (regionResult) {
+            // Calculate renewable percentage
+            const renewablePercentage = region.generationmix
+              .filter(mix => ['wind', 'solar', 'hydro', 'biomass'].includes(mix.fuel))
+              .reduce((sum, mix) => sum + mix.perc, 0);
+
+            // Store the data
+            await env.DB.prepare(`
+              INSERT INTO energy_usage (
+                region_id, timestamp, carbon_intensity, renewable_percentage
+              ) VALUES (?, ?, ?, ?)
+            `).bind(
+              regionResult.id,
+              data.data[0].from,
+              region.intensity.forecast,
+              renewablePercentage
+            ).run();
+
+            return {
+              region: region.shortname,
+              timestamp: data.data[0].from,
+              carbon_intensity: region.intensity.forecast,
+              renewable_percentage: renewablePercentage
+            };
+          }
         }));
 
-        return jsonResponse(results, request);
+        return jsonResponse(results.filter(Boolean), request);
       } catch (error) {
         console.error('Error fetching energy data:', error);
         return jsonResponse({ error: "Failed to fetch energy data: " + error.message }, request, 500);
@@ -179,8 +391,6 @@ export default {
           SELECT 
             r.name as region,
             e.timestamp,
-            e.demand_actual,
-            e.generation_mw,
             e.carbon_intensity,
             e.renewable_percentage
           FROM energy_usage e
@@ -235,154 +445,33 @@ export default {
       }
     }
 
-    // OAuth endpoints
-    if (request.method === "POST" && url.pathname === "/auth/google/callback") {
-      try {
-        const { code } = await request.json()
-        console.log('Received code from frontend, attempting token exchange...')
-        
-        // Exchange code for tokens
-        const tokenRequestBody = new URLSearchParams({
-          code,
-          client_id: env.GOOGLE_CLIENT_ID,
-          client_secret: env.GOOGLE_CLIENT_SECRET,
-          redirect_uri: env.APP_URL + '/login',
-          grant_type: 'authorization_code'
-        })
-        
-        console.log('Token request configuration:', {
-          url: 'https://oauth2.googleapis.com/token',
-          clientId: env.GOOGLE_CLIENT_ID,
-          redirectUri: env.APP_URL + '/login'
-        })
-
-        const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded'
-          },
-          body: tokenRequestBody.toString()
-        })
-
-        if (!tokenResponse.ok) {
-          const errorData = await tokenResponse.text()
-          console.error('Token exchange failed:', {
-            status: tokenResponse.status,
-            error: errorData
-          })
-          throw new Error(`Token exchange failed: ${errorData}`)
-        }
-
-        const tokens = await tokenResponse.json()
-        console.log('Successfully exchanged code for tokens')
-        
-        // Get user info
-        const userResponse = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-          headers: {
-            Authorization: `Bearer ${tokens.access_token}`
-          }
-        })
-
-        if (!userResponse.ok) {
-          const errorData = await userResponse.text()
-          console.error('User info fetch failed:', {
-            status: userResponse.status,
-            error: errorData
-          })
-          throw new Error('Failed to get user info')
-        }
-
-        const userData = await userResponse.json()
-        console.log('Successfully fetched user info')
-        
-        // Create or update user in database
-        const user = {
-          id: userData.sub,
-          email: userData.email,
-          name: userData.name,
-          picture: userData.picture
-        }
-
-        try {
-          // Store user in database
-          await env.DB.prepare(
-            `INSERT INTO users (id, email, name, picture) 
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET 
-             email = excluded.email,
-             name = excluded.name,
-             picture = excluded.picture`
-          ).bind(user.id, user.email, user.name, user.picture).run()
-          
-          console.log('Successfully stored user in database')
-
-          // Create session token
-          const sessionToken = crypto.randomUUID()
-          
-          // Store session
-          await env.DB.prepare(
-            `INSERT INTO sessions (token, user_id, expires_at)
-             VALUES (?, ?, datetime('now', '+7 days'))`
-          ).bind(sessionToken, user.id).run()
-          
-          console.log('Successfully created session')
-
-          return jsonResponse({ token: sessionToken, user }, request)
-        } catch (dbError) {
-          console.error('Database operation failed:', dbError)
-          throw new Error('Failed to store user data')
-        }
-      } catch (error) {
-        console.error('OAuth callback error:', error)
-        return jsonResponse({ error: error.message || 'Authentication failed' }, request, 500)
-      }
-    }
-
-    if (request.method === "GET" && url.pathname === "/auth/validate") {
-      try {
-        const token = request.headers.get('Authorization')?.replace('Bearer ', '')
-        
-        if (!token) {
-          return jsonResponse({ error: 'No token provided' }, request, 401)
-        }
-
-        const session = await env.DB.prepare(
-          `SELECT users.* FROM sessions 
-           JOIN users ON users.id = sessions.user_id
-           WHERE sessions.token = ? 
-           AND sessions.expires_at > datetime('now')`
-        ).bind(token).first()
-
-        if (!session) {
-          return jsonResponse({ error: 'Invalid or expired token' }, request, 401)
-        }
-
-        return jsonResponse({ user: session }, request)
-      } catch (error) {
-        console.error('Token validation error:', error)
-        return jsonResponse({ error: 'Validation failed' }, request, 500)
-      }
-    }
-
-    if (request.method === "POST" && url.pathname === "/auth/logout") {
-      try {
-        const token = request.headers.get('Authorization')?.replace('Bearer ', '')
-        
-        if (token) {
-          try {
-            await env.DB.prepare('DELETE FROM sessions WHERE token = ?').bind(token).run()
-          } catch (error) {
-            console.error('Logout error:', error)
-          }
-        }
-
-        return jsonResponse({ success: true }, request)
-      } catch (error) {
-        console.error('Logout error:', error)
-        return jsonResponse({ error: 'Logout failed' }, request, 500)
-      }
-    }
-
     return new Response("Not found", { status: 404 });
   },
 }; 
+
+// Helper functions
+async function upsertUser(db, userInfo) {
+  const { email, name, picture } = userInfo;
+  
+  const result = await db.prepare(
+    `INSERT INTO users (email, name, picture) 
+     VALUES (?, ?, ?)
+     ON CONFLICT (email) DO UPDATE SET
+     name = excluded.name,
+     picture = excluded.picture
+     RETURNING *`
+  )
+  .bind(email, name, picture)
+  .first();
+  
+  return result;
+}
+
+async function createSessionToken(user) {
+  // Create a simple token (you might want to use JWT here)
+  return btoa(JSON.stringify({
+    userId: user.id,
+    email: user.email,
+    expires: Date.now() + (24 * 60 * 60 * 1000), // 24 hours
+  }));
+} 
